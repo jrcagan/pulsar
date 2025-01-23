@@ -1,0 +1,11 @@
+[package]
+name = "gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+atomic_float = "1.1.0"
+eframe = "0.30.0"
+egui = "0.30.0"
+rodio = "0.20.1"
+synth = { path = "../synth" }

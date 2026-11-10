@@ -239,7 +239,19 @@ impl SampleData {
    /// Reads a wav, mp3, flac or ogg file.
    pub fn from_file(path: &Path) -> Result<SampleData, String> {
       let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-      let decoder = rodio::Decoder::new(std::io::BufReader::new(file)).map_err(|e| e.to_string())?;
+      Self::decode(std::io::BufReader::new(file))
+   }
+
+   /// Reads a sound file that is already in memory, such as one built into the program.
+   pub fn from_bytes(bytes: &'static [u8]) -> Result<SampleData, String> {
+      Self::decode(std::io::Cursor::new(bytes))
+   }
+
+   fn decode<R>(reader: R) -> Result<SampleData, String>
+   where
+      R: std::io::Read + std::io::Seek + Send + Sync + 'static,
+   {
+      let decoder = rodio::Decoder::new(reader).map_err(|e| e.to_string())?;
       let channels = decoder.channels().max(1) as usize;
       let sample_rate = decoder.sample_rate();
       let interleaved: Vec<f32> = decoder.convert_samples().collect();
@@ -266,6 +278,24 @@ impl SampleData {
       let next = (index + 1).min(last);
       let blend = exact - index as f32;
       self.samples[index] * (1.0 - blend) + self.samples[next] * blend
+   }
+}
+
+/// Where in the sample (0.0 = start, 1.0 = end) to read at `phase` of the
+/// cycle, or None while it should be silent.
+///
+/// Normally the whole sample is squeezed into the first `silence` of the cycle
+/// and the rest is quiet. When `gated`, the sample keeps its own timing across
+/// the whole cycle and is chopped instead: the cycle is split into `gates`
+/// equal slots, and each slot is on for its first `silence` and quiet after.
+pub fn sample_position(phase: f32, silence: f32, gated: bool, gates: f32) -> Option<f32> {
+   let silence = silence.clamp(0.001, 1.0);
+   if gated {
+      let slot = (phase * gates.round().max(1.0)).fract();
+      (slot <= silence).then_some(phase)
+   } else {
+      let position = phase / silence;
+      (position <= 1.0).then_some(position)
    }
 }
 
@@ -299,6 +329,11 @@ pub struct Settings {
    /// Sample mode's stand-in for frequency: how many times per sample-length
    /// the cycle repeats. 1.0 with Silence at 1.0 plays the sample as recorded.
    pub speed: f32,
+   /// Sample mode: chop the sample with regular silences (like a trance gate)
+   /// instead of squeezing it and leaving one silence at the end
+   pub gated: bool,
+   /// How many on/off slots the gate fits into each cycle
+   pub gates: f32,
 }
 
 impl Default for Settings {
@@ -317,6 +352,8 @@ impl Default for Settings {
          lfo_targets: 0,
          use_sample: false,
          speed: 1.0,
+         gated: false,
+         gates: 16.0,
       }
    }
 }
@@ -359,6 +396,8 @@ pub struct Params {
    lfo_targets: AtomicU8,
    pub use_sample: AtomicBool,
    pub speed: AtomicF32,
+   pub gated: AtomicBool,
+   pub gates: AtomicF32,
    sample: Mutex<Option<Arc<SampleData>>>,
    /// Goes up every time the sample is replaced, so the audio thread knows to fetch it.
    sample_version: AtomicU32,
@@ -388,6 +427,8 @@ impl Default for Params {
          lfo_targets: AtomicU8::new(s.lfo_targets),
          use_sample: AtomicBool::new(s.use_sample),
          speed: AtomicF32::new(s.speed),
+         gated: AtomicBool::new(s.gated),
+         gates: AtomicF32::new(s.gates),
          sample: Mutex::new(None),
          sample_version: AtomicU32::new(0),
          shape_now: AtomicF32::new(s.shape),
@@ -432,6 +473,8 @@ impl Params {
          lfo_targets: self.lfo_targets.load(o),
          use_sample: self.use_sample.load(o),
          speed: self.speed.load(o),
+         gated: self.gated.load(o),
+         gates: self.gates.load(o),
       }
    }
 }
@@ -561,6 +604,8 @@ impl Voice {
       now.lfo_depth += a * (target.lfo_depth - now.lfo_depth);
       now.speed += a * (target.speed - now.speed);
       now.use_sample = target.use_sample;
+      now.gated = target.gated;
+      now.gates = target.gates;
       now.lfo_targets = target.lfo_targets;
       now.lfo_rate = target.lfo_rate;
       now.lfo_shape = target.lfo_shape;
@@ -585,14 +630,16 @@ impl Voice {
       let (raw, distorted) = match &self.sample {
          Some(sample) if set.use_sample => {
             // Sample mode, as in pulsar synthesis: every cycle reads the whole
-            // sample during the first `silence` part of the cycle and is quiet
-            // for the rest. So the cycle rate sets how fast the sample is read
+            // sample, with Silence either squeezing it to leave a quiet tail
+            // or gating it. So the cycle rate sets how fast the sample is read
             // rather than a pitch in Hz.
             let cycles_per_second = set.speed / sample.duration();
             self.phase += cycles_per_second / self.sample_rate;
             self.phase -= self.phase.floor();
-            let position = self.phase / set.silence;
-            let pulse = if position <= 1.0 { sample.at(position) } else { 0.0 };
+            let pulse = match sample_position(self.phase, set.silence, set.gated, set.gates) {
+               Some(position) => sample.at(position),
+               None => 0.0,
+            };
             (sample.at(self.phase), pulse.clamp(-1.0, 1.0))
          }
          _ => {
@@ -809,6 +856,41 @@ mod tests {
       assert!(cycle[10900] > 0.95, "end of the pulse: {}", cycle[10900]);
       // ...and the second half is silent.
       assert!(cycle[12000..22000].iter().all(|v| v.abs() < 0.01));
+   }
+
+   #[test]
+   fn gate_chops_the_sample_without_changing_its_timing() {
+      // 4 gates, each on for its first half.
+      let at = |phase: f32| sample_position(phase, 0.5, true, 4.0);
+      // While on, the sample is read at its normal place...
+      assert_eq!(at(0.05), Some(0.05));
+      assert_eq!(at(0.30), Some(0.30));
+      assert_eq!(at(0.80), Some(0.80));
+      // ...and the second half of every quarter is quiet.
+      assert_eq!(at(0.20), None);
+      assert_eq!(at(0.45), None);
+      assert_eq!(at(0.95), None);
+      // Silence at 1.0 means the gate never closes.
+      assert_eq!(sample_position(0.45, 1.0, true, 4.0), Some(0.45));
+      // Not gated, for comparison: squeezed into the first half, then quiet.
+      assert_eq!(sample_position(0.25, 0.5, false, 4.0), Some(0.5));
+      assert_eq!(sample_position(0.75, 0.5, false, 4.0), None);
+
+      // And through the voice: a one-second ramp comes out as 4 bursts that
+      // still rise across the whole second.
+      let ramp: Vec<f32> = (0..1000).map(|i| 0.2 + 0.8 * i as f32 / 999.0).collect();
+      let sample = Arc::new(SampleData { samples: ramp, sample_rate: 1000 });
+      let settings = Settings { use_sample: true, silence: 0.5, gated: true, gates: 4.0, ..Settings::default() };
+      let mut voice = Voice::new(44100);
+      voice.set_sample(Some(sample));
+      voice.snap(&settings);
+      let cycle: Vec<f32> = (0..44100).map(|_| voice.tick(&settings).filtered).collect();
+      for gate in 0..4 {
+         let start = gate * 11025;
+         assert!(cycle[start + 500..start + 5000].iter().all(|v| *v > 0.15), "gate {gate} should be on");
+         assert!(cycle[start + 6500..start + 10500].iter().all(|v| v.abs() < 0.01), "gate {gate} should close");
+      }
+      assert!((cycle[35000] - (0.2 + 0.8 * 35000.0 / 44100.0)).abs() < 0.02);
    }
 
    #[test]

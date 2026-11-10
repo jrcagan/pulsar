@@ -9,11 +9,14 @@ use std::f32::consts::PI;
 use std::path::Path;
 use std::sync::{atomic::Ordering, Arc};
 use synth::{
-    filter_response, lfo_value, wave_value, LfoShape, LfoTarget, Oscillator, Params, SampleData, Settings,
+    filter_response, lfo_value, sample_position, wave_value, LfoShape, LfoTarget, Oscillator, Params, SampleData, Settings,
     Voice, WaveType, MAX_SHAPE,
 };
 
 const SAMPLE_RATE: u32 = 44100;
+/// The sample that is built into the program and loaded at startup.
+const DEFAULT_SAMPLE: &[u8] = include_bytes!("../assets/idmSynth.wav");
+const DEFAULT_SAMPLE_NAME: &str = "idmSynth.wav";
 /// How much time the scope shows, in seconds.
 const SCOPE_WINDOW: f32 = 0.010;
 /// The scope runs the synth at a multiple of the audio rate so its lines are smooth.
@@ -67,7 +70,7 @@ struct Pulsar {
 
 impl Pulsar {
     fn new() -> Self {
-        Self {
+        let mut app = Self {
             sink: None,
             _stream: None,
             params: Arc::new(Params::default()),
@@ -77,7 +80,13 @@ impl Pulsar {
             sample_peaks: Vec::new(),
             sample_error: None,
             scope_phase: 0.0,
+        };
+        // The built-in sample is ready in the Sample tab from the start; the
+        // synth still opens on the waves until Source is switched over.
+        if let Ok(data) = SampleData::from_bytes(DEFAULT_SAMPLE) {
+            app.set_sample(data, DEFAULT_SAMPLE_NAME.to_string());
         }
+        app
     }
 
     /// Loads a sound file and switches the synth over to playing it.
@@ -85,27 +94,32 @@ impl Pulsar {
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         match SampleData::from_file(path) {
             Ok(data) => {
-                let slices = 480;
-                let per_slice = (data.samples.len() / slices).max(1);
-                self.sample_peaks = data
-                    .samples
-                    .chunks(per_slice)
-                    .map(|chunk| {
-                        let low = chunk.iter().copied().fold(f32::MAX, f32::min);
-                        let high = chunk.iter().copied().fold(f32::MIN, f32::max);
-                        (low, high)
-                    })
-                    .collect();
-                let data = Arc::new(data);
-                self.params.set_sample(Some(data.clone()));
+                self.set_sample(data, name);
                 self.params.use_sample.store(true, Ordering::Relaxed);
-                self.sample = Some(data);
-                self.sample_name = name;
-                self.sample_error = None;
                 self.tab = Tab::Sample;
             }
             Err(error) => self.sample_error = Some(format!("Couldn't load {name}: {error}")),
         }
+    }
+
+    /// Makes `data` the current sample, without changing what is playing.
+    fn set_sample(&mut self, data: SampleData, name: String) {
+        let slices = 480;
+        let per_slice = (data.samples.len() / slices).max(1);
+        self.sample_peaks = data
+            .samples
+            .chunks(per_slice)
+            .map(|chunk| {
+                let low = chunk.iter().copied().fold(f32::MAX, f32::min);
+                let high = chunk.iter().copied().fold(f32::MIN, f32::max);
+                (low, high)
+            })
+            .collect();
+        let data = Arc::new(data);
+        self.params.set_sample(Some(data.clone()));
+        self.sample = Some(data);
+        self.sample_name = name;
+        self.sample_error = None;
     }
 
     fn choose_sample(&mut self) {
@@ -194,7 +208,10 @@ impl Pulsar {
         let mut choose = sample_strip(ui, loaded, &self.sample_peaks, sampling, playhead, self.sample_error.as_deref()).clicked();
 
         let params = &self.params;
-        ui.columns(3, |cols| {
+        let gated = params.gated.load(Ordering::Relaxed);
+        // The Gates knob only appears while the gate is on.
+        let columns = if gated { 5 } else { 4 };
+        ui.columns(columns, |cols| {
             cols[0].vertical_centered(|ui| {
                 let knob = Knob::new("Speed", (0.1, 500.0), 1.0).logarithmic().format(speed);
                 bound_knob(ui, &params.speed, knob);
@@ -203,7 +220,22 @@ impl Pulsar {
                 bound_knob(ui, &params.silence, Knob::new("Silence", (0.0, 1.0), 1.0));
             });
             cols[2].vertical_centered(|ui| {
-                if source_toggle(ui, sampling).clicked() {
+                // What Silence does: squeeze the sample and leave a quiet tail,
+                // or chop it with regular quiet gaps.
+                let text = if gated { "Gate" } else { "Tail" };
+                if switch(ui, gated, text, "Silence as").clicked() {
+                    params.gated.store(!gated, Ordering::Relaxed);
+                }
+            });
+            if gated {
+                cols[3].vertical_centered(|ui| {
+                    let knob = Knob::new("Gates", (1.0, 256.0), 16.0).logarithmic().format(|v| format!("{:.0}", v.round()));
+                    bound_knob(ui, &params.gates, knob);
+                });
+            }
+            cols[columns - 1].vertical_centered(|ui| {
+                let text = if sampling { "Sample" } else { "Waves" };
+                if switch(ui, sampling, text, "Source").clicked() {
                     if loaded.is_some() {
                         params.use_sample.store(!sampling, Ordering::Relaxed);
                     } else {
@@ -310,8 +342,11 @@ impl App for Pulsar {
             // Where in the sample that is; nothing during the silent part of the cycle.
             let playhead = live_phase
                 .filter(|_| sample.is_some())
-                .map(|phase| phase / moved.silence)
-                .filter(|position| *position <= 1.0);
+                // Gated, the playhead keeps travelling through the quiet slots.
+            .and_then(|phase| match moved.gated {
+                true => Some(phase),
+                false => sample_position(phase, moved.silence, false, moved.gates),
+            });
 
             scope(ui, &settings, sample, lfo, live_phase, time);
             if playing {
@@ -480,7 +515,7 @@ impl Knob {
     }
 
     fn show(self, ui: &mut Ui, value: &mut f32) -> Response {
-        let (rect, mut response) = ui.allocate_exact_size(vec2(110.0, 122.0), Sense::click_and_drag());
+        let (rect, mut response) = ui.allocate_exact_size(vec2(ui.available_width().min(110.0), 122.0), Sense::click_and_drag());
         let mut dial = self.to_dial(*value);
         let before = dial;
 
@@ -775,29 +810,29 @@ fn sample_strip(
     response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
-/// A switch between playing the waves and playing the sample.
-fn source_toggle(ui: &mut Ui, sample_on: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(110.0, 122.0), Sense::click());
+/// A two-way switch with its current choice written underneath.
+fn switch(ui: &mut Ui, on: bool, choice: &str, label: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width().min(110.0), 122.0), Sense::click());
     let painter = ui.painter();
     let center = pos2(rect.center().x, rect.top() + 46.0);
 
     let pill = Rect::from_center_size(center, vec2(60.0, 30.0));
-    let fill = if sample_on { ACCENT } else if response.hovered() { RAISED } else { TRACK };
+    let fill = if on { ACCENT } else if response.hovered() { RAISED } else { TRACK };
     painter.rect_filled(pill, 15.0, fill);
-    let handle_x = if sample_on { pill.right() - 15.0 } else { pill.left() + 15.0 };
-    painter.circle_filled(pos2(handle_x, center.y), 11.0, if sample_on { BG } else { TEXT });
+    let handle_x = if on { pill.right() - 15.0 } else { pill.left() + 15.0 };
+    painter.circle_filled(pos2(handle_x, center.y), 11.0, if on { BG } else { TEXT });
 
     painter.text(
         pos2(center.x, rect.top() + 94.0),
         Align2::CENTER_CENTER,
-        if sample_on { "Sample" } else { "Waves" },
+        choice,
         FontId::proportional(15.0),
         TEXT,
     );
     painter.text(
         pos2(center.x, rect.top() + 112.0),
         Align2::CENTER_CENTER,
-        "Source",
+        label,
         FontId::proportional(12.0),
         DIM,
     );

@@ -3,3 +3,8 @@ members = [
     "synth",
     "gui",
 ]
+
+# objc2 0.5 has a debug-only check that panics at launch on recent macOS;
+# turning it off lets `cargo run` work without --release.
+[profile.dev.package.objc2]
+debug-assertions = false

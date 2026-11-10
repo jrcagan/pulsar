@@ -7,5 +7,6 @@ edition = "2021"
 atomic_float = "1.1.0"
 eframe = "0.30.0"
 egui = "0.30.0"
+rfd = "0.15"
 rodio = "0.20.1"
 synth = { path = "../synth" }

@@ -6,10 +6,11 @@ use egui::{
 };
 use rodio::{OutputStream, Sink};
 use std::f32::consts::PI;
+use std::path::Path;
 use std::sync::{atomic::Ordering, Arc};
 use synth::{
-    filter_response, lfo_value, wave_value, LfoShape, Oscillator, Params, Settings, Voice,
-    WaveType, MAX_SHAPE,
+    filter_response, lfo_value, wave_value, LfoShape, LfoTarget, Oscillator, Params, SampleData, Settings,
+    Voice, WaveType, MAX_SHAPE,
 };
 
 const SAMPLE_RATE: u32 = 44100;
@@ -44,6 +45,7 @@ fn blend(from: Color32, to: Color32, t: f32) -> Color32 {
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Wave,
+    Sample,
     Filter,
     Lfo,
 }
@@ -53,6 +55,14 @@ struct Pulsar {
     _stream: Option<OutputStream>,
     params: Arc<Params>,
     tab: Tab,
+    sample: Option<Arc<SampleData>>,
+    sample_name: String,
+    /// Lowest and highest value in each slice of the sample, for drawing it
+    sample_peaks: Vec<(f32, f32)>,
+    sample_error: Option<String>,
+    /// Where the scope thinks playback is within the cycle. It follows the
+    /// audio thread's reports but moves smoothly between them.
+    scope_phase: f32,
 }
 
 impl Pulsar {
@@ -62,7 +72,53 @@ impl Pulsar {
             _stream: None,
             params: Arc::new(Params::default()),
             tab: Tab::Wave,
+            sample: None,
+            sample_name: String::new(),
+            sample_peaks: Vec::new(),
+            sample_error: None,
+            scope_phase: 0.0,
         }
+    }
+
+    /// Loads a sound file and switches the synth over to playing it.
+    fn load_sample(&mut self, path: &Path) {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        match SampleData::from_file(path) {
+            Ok(data) => {
+                let slices = 480;
+                let per_slice = (data.samples.len() / slices).max(1);
+                self.sample_peaks = data
+                    .samples
+                    .chunks(per_slice)
+                    .map(|chunk| {
+                        let low = chunk.iter().copied().fold(f32::MAX, f32::min);
+                        let high = chunk.iter().copied().fold(f32::MIN, f32::max);
+                        (low, high)
+                    })
+                    .collect();
+                let data = Arc::new(data);
+                self.params.set_sample(Some(data.clone()));
+                self.params.use_sample.store(true, Ordering::Relaxed);
+                self.sample = Some(data);
+                self.sample_name = name;
+                self.sample_error = None;
+                self.tab = Tab::Sample;
+            }
+            Err(error) => self.sample_error = Some(format!("Couldn't load {name}: {error}")),
+        }
+    }
+
+    fn choose_sample(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("Audio", &["wav", "mp3", "flac", "ogg"])
+            .pick_file();
+        if let Some(path) = picked {
+            self.load_sample(&path);
+        }
+    }
+
+    fn sampling(&self) -> bool {
+        self.sample.is_some() && self.params.use_sample.load(Ordering::Relaxed)
     }
 
     fn is_playing(&self) -> bool {
@@ -99,13 +155,16 @@ impl Pulsar {
     }
 
     fn wave_tab(&mut self, ui: &mut Ui, shape_now: f32) {
+        let sampling = self.sampling();
         let params = &self.params;
+        let shape_before = params.shape.load(Ordering::Relaxed);
 
         // One button per wave. They light up by how much of each wave is in
         // the sound right now, so the LFO can be seen sweeping across them.
         strip(ui, WaveType::ALL.len(), |ui, i| {
             let wave = WaveType::ALL[i];
-            let weight = (1.0 - (shape_now - i as f32).abs()).max(0.0);
+            // Nothing is lit while the sample is playing instead.
+            let weight = if sampling { 0.0 } else { (1.0 - (shape_now - i as f32).abs()).max(0.0) };
             let icon = |t: f32| match wave {
                 WaveType::Noise => noise((t * 40.0) as u32 * 31 + 5),
                 // Stop just short of a full cycle so the saw doesn't wrap at the edge.
@@ -113,27 +172,63 @@ impl Pulsar {
             };
             if shape_button(ui, wave.name(), weight, icon).clicked() {
                 params.shape.store(i as f32, Ordering::Relaxed);
+                params.use_sample.store(false, Ordering::Relaxed);
             }
         });
 
         knob_row(ui, vec![
-            (&params.frequency, Knob::new("Frequency", (20.0, 2000.0), 440.0).logarithmic().format(hertz)),
+            (&params.frequency, Knob::new("Frequency", (20.0, 10000.0), 440.0).logarithmic().format(hertz)),
             (&params.shape, Knob::new("Wave", (0.0, MAX_SHAPE), 0.0).format(wave_blend)),
             (&params.silence, Knob::new("Silence", (0.0, 1.0), 1.0)),
         ]);
+
+        // Picking a wave with the knob also switches back from the sample.
+        if params.shape.load(Ordering::Relaxed) != shape_before {
+            params.use_sample.store(false, Ordering::Relaxed);
+        }
     }
 
-    fn filter_tab(&mut self, ui: &mut Ui, settings: &Settings) {
+    fn sample_tab(&mut self, ui: &mut Ui, playhead: Option<f32>) {
+        let sampling = self.sampling();
+        let loaded = self.sample.as_ref().map(|s| (self.sample_name.as_str(), s.duration()));
+        let mut choose = sample_strip(ui, loaded, &self.sample_peaks, sampling, playhead, self.sample_error.as_deref()).clicked();
+
         let params = &self.params;
-        filter_graph(ui, params, settings);
+        ui.columns(3, |cols| {
+            cols[0].vertical_centered(|ui| {
+                let knob = Knob::new("Speed", (0.1, 500.0), 1.0).logarithmic().format(speed);
+                bound_knob(ui, &params.speed, knob);
+            });
+            cols[1].vertical_centered(|ui| {
+                bound_knob(ui, &params.silence, Knob::new("Silence", (0.0, 1.0), 1.0));
+            });
+            cols[2].vertical_centered(|ui| {
+                if source_toggle(ui, sampling).clicked() {
+                    if loaded.is_some() {
+                        params.use_sample.store(!sampling, Ordering::Relaxed);
+                    } else {
+                        choose = true;
+                    }
+                }
+            });
+        });
+
+        if choose {
+            self.choose_sample();
+        }
+    }
+
+    fn filter_tab(&mut self, ui: &mut Ui, settings: &Settings, lfo: f32) {
+        let params = &self.params;
+        filter_graph(ui, params, settings, lfo);
         knob_row(ui, vec![
             (&params.cutoff, Knob::new("Cutoff", (20.0, 18000.0), 18000.0).logarithmic().format(hertz)),
-            (&params.resonance, Knob::new("Resonance", (0.0, 1.0), 0.1).format(percent)),
+            (&params.resonance, Knob::new("Resonance", (0.0, 1.0), 0.1).percent()),
             (&params.filter_morph, Knob::new("Type", (0.0, 1.0), 0.0).format(filter_type)),
         ]);
     }
 
-    fn lfo_tab(&mut self, ui: &mut Ui) {
+    fn lfo_tab(&mut self, ui: &mut Ui, settings: &Settings) {
         let params = &self.params;
         let current = params.lfo_shape();
 
@@ -149,17 +244,30 @@ impl Pulsar {
             }
         });
 
-        knob_row(ui, vec![
-            (&params.lfo_rate, Knob::new("Rate", (0.05, 20.0), 1.0).logarithmic().format(|v| format!("{v:.2} Hz"))),
-            (&params.lfo_depth, Knob::new("Depth", (0.0, 4.0), 0.0).format(lfo_depth)),
-        ]);
+        let sampling = settings.use_sample && self.sample.is_some();
+        ui.columns(3, |cols| {
+            cols[0].vertical_centered(|ui| {
+                let knob = Knob::new("Rate", (0.05, 20.0), 1.0).logarithmic().format(|v| format!("{v:.2} Hz"));
+                bound_knob(ui, &params.lfo_rate, knob);
+            });
+            cols[1].vertical_centered(|ui| {
+                bound_knob(ui, &params.lfo_depth, Knob::new("Depth", (0.0, 1.0), 0.5).percent());
+            });
+            cols[2].vertical_centered(|ui| lfo_targets(ui, params, settings, sampling));
+        });
     }
 }
 
 impl App for Pulsar {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.key_pressed(Key::Space)) {
+        // Space plays and stops, unless a number is being typed into a knob.
+        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Space)) {
             self.toggle_sound();
+        }
+        // A sound file dropped anywhere on the window gets loaded.
+        let dropped = ctx.input(|i| i.raw.dropped_files.first().and_then(|file| file.path.clone()));
+        if let Some(path) = dropped {
+            self.load_sample(&path);
         }
 
         let frame = egui::Frame::none().fill(BG).inner_margin(20.0);
@@ -177,14 +285,42 @@ impl App for Pulsar {
             };
 
             let time = ui.input(|i| i.time);
-            scope(ui, &settings, shape_now, playing, time);
+            let sample = if settings.use_sample { self.sample.clone() } else { None };
+            let lfo = if playing { self.params.lfo_now.load(Ordering::Relaxed) } else { 0.0 };
+            let moved = settings.modulated(lfo);
+
+            // Follow the audio thread's position. It reports in bursts, so move
+            // at the expected speed and lean gently toward each report.
+            let live_phase = if playing {
+                let cycles_per_second = match &sample {
+                    Some(sample) => moved.speed / sample.duration(),
+                    None => moved.frequency,
+                };
+                let dt = ui.input(|i| i.stable_dt).min(0.1);
+                let reported = self.params.phase_now.load(Ordering::Relaxed);
+                let mut phase = self.scope_phase + dt * cycles_per_second;
+                let mut gap = reported - phase;
+                gap -= gap.round();
+                phase += if gap.abs() > 0.2 { gap } else { gap * 0.1 };
+                self.scope_phase = phase.rem_euclid(1.0);
+                Some(self.scope_phase)
+            } else {
+                None
+            };
+            // Where in the sample that is; nothing during the silent part of the cycle.
+            let playhead = live_phase
+                .filter(|_| sample.is_some())
+                .map(|phase| phase / moved.silence)
+                .filter(|position| *position <= 1.0);
+
+            scope(ui, &settings, sample, lfo, live_phase, time);
             if playing {
                 ctx.request_repaint();
             }
 
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                for (tab, name) in [(Tab::Wave, "Wave"), (Tab::Filter, "Filter"), (Tab::Lfo, "LFO")] {
+                for (tab, name) in [(Tab::Wave, "Wave"), (Tab::Sample, "Sample"), (Tab::Filter, "Filter"), (Tab::Lfo, "LFO")] {
                     if tab_button(ui, name, self.tab == tab).clicked() {
                         self.tab = tab;
                     }
@@ -193,8 +329,9 @@ impl App for Pulsar {
 
             match self.tab {
                 Tab::Wave => self.wave_tab(ui, shape_now),
-                Tab::Filter => self.filter_tab(ui, &settings),
-                Tab::Lfo => self.lfo_tab(ui),
+                Tab::Sample => self.sample_tab(ui, playhead),
+                Tab::Filter => self.filter_tab(ui, &settings, lfo),
+                Tab::Lfo => self.lfo_tab(ui, &settings),
             }
 
             let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
@@ -208,7 +345,7 @@ impl App for Pulsar {
                     }
                 });
                 cols[1].vertical_centered(|ui| {
-                    let knob = Knob::new("Volume", (0.0, 1.0), 0.35).format(percent);
+                    let knob = Knob::new("Volume", (0.0, 1.0), 0.35).percent();
                     bound_knob(ui, &self.params.volume, knob);
                 });
             });
@@ -230,6 +367,16 @@ fn hertz(v: f32) -> String {
 
 fn percent(v: f32) -> String {
     format!("{:.0}%", v * 100.0)
+}
+
+fn speed(v: f32) -> String {
+    if v >= 100.0 {
+        format!("× {v:.0}")
+    } else if v >= 10.0 {
+        format!("× {v:.1}")
+    } else {
+        format!("× {v:.2}")
+    }
 }
 
 fn wave_blend(v: f32) -> String {
@@ -256,26 +403,20 @@ fn filter_type(v: f32) -> String {
     name.to_string()
 }
 
-fn lfo_depth(v: f32) -> String {
-    if v < 0.02 {
-        "Off".to_string()
-    } else {
-        format!("± {v:.1} waves")
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Widgets
 // ---------------------------------------------------------------------------
 
 /// A rotary knob. Drag up/down (or left/right) to turn it, hold Shift for fine
-/// control, scroll to nudge, double-click to reset.
+/// control, scroll to nudge, click to type a value, double-click to reset.
 struct Knob {
     label: &'static str,
     range: (f32, f32),
     default: f32,
     logarithmic: bool,
     format: fn(f32) -> String,
+    /// What a typed number is divided by to get the value (100 for percentages)
+    typed_scale: f32,
 }
 
 impl Knob {
@@ -286,6 +427,7 @@ impl Knob {
             default,
             logarithmic: false,
             format: |v| format!("{v:.2}"),
+            typed_scale: 1.0,
         }
     }
 
@@ -296,6 +438,13 @@ impl Knob {
 
     fn format(mut self, format: fn(f32) -> String) -> Self {
         self.format = format;
+        self
+    }
+
+    /// Shown, and typed, as 0 to 100%
+    fn percent(mut self) -> Self {
+        self.format = percent;
+        self.typed_scale = 100.0;
         self
     }
 
@@ -319,13 +468,33 @@ impl Knob {
         }
     }
 
+    /// Reads a typed value such as "880", "1.5k", "40%" or "x2", kept within range.
+    fn parse(&self, text: &str) -> Option<f32> {
+        let text = text.trim().to_lowercase();
+        let digits: String = text.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
+        let mut number: f32 = digits.parse().ok()?;
+        if text.contains('k') {
+            number *= 1000.0;
+        }
+        Some((number / self.typed_scale).clamp(self.range.0, self.range.1))
+    }
+
     fn show(self, ui: &mut Ui, value: &mut f32) -> Response {
         let (rect, mut response) = ui.allocate_exact_size(vec2(110.0, 122.0), Sense::click_and_drag());
         let mut dial = self.to_dial(*value);
         let before = dial;
 
+        // The text being typed, if this knob's value is being edited.
+        let edit_id = response.id.with("typed value");
+        let mut typed: Option<String> = ui.data(|data| data.get_temp(edit_id));
+        let was_typing = typed.is_some();
+
         if response.double_clicked() {
             dial = self.to_dial(self.default);
+            typed = None;
+        } else if response.clicked() && typed.is_none() {
+            typed = Some(String::new());
+            ui.memory_mut(|memory| memory.request_focus(edit_id));
         } else if response.dragged() {
             let delta = response.drag_delta();
             let fine = ui.input(|i| i.modifiers.shift);
@@ -340,6 +509,38 @@ impl Knob {
         if dial != before {
             *value = self.from_dial(dial);
             response.mark_changed();
+        }
+
+        // The text box appears the frame after the click that asked for it, so
+        // that same click doesn't count as clicking away from it.
+        let value_center = pos2(rect.center().x, rect.top() + 94.0);
+        if let (true, Some(text)) = (was_typing, typed.as_mut()) {
+            let field = Rect::from_center_size(value_center, vec2(86.0, 22.0));
+            let edit = egui::TextEdit::singleline(text)
+                .id(edit_id)
+                .hint_text((self.format)(*value))
+                .horizontal_align(egui::Align::Center)
+                .font(FontId::proportional(15.0));
+            if ui.put(field, edit).lost_focus() {
+                // Enter or clicking away accepts; Escape cancels.
+                if !ui.input(|i| i.key_pressed(Key::Escape)) {
+                    if let Some(new_value) = self.parse(text) {
+                        *value = new_value;
+                        dial = self.to_dial(new_value);
+                        response.mark_changed();
+                    }
+                }
+                typed = None;
+            }
+        }
+        match &typed {
+            Some(text) => {
+                ui.data_mut(|data| data.insert_temp(edit_id, text.clone()));
+                if !was_typing {
+                    ui.ctx().request_repaint();
+                }
+            }
+            None => ui.data_mut(|data| data.remove::<String>(edit_id)),
         }
 
         // The dial sweeps 270 degrees, with the gap at the bottom.
@@ -369,13 +570,15 @@ impl Knob {
             stroke(3.0, if active { ACCENT } else { TEXT }),
         );
 
-        painter.text(
-            pos2(center.x, rect.top() + 94.0),
-            Align2::CENTER_CENTER,
-            (self.format)(*value),
-            FontId::proportional(15.0),
-            TEXT,
-        );
+        if !(was_typing && typed.is_some()) {
+            painter.text(
+                value_center,
+                Align2::CENTER_CENTER,
+                (self.format)(*value),
+                FontId::proportional(15.0),
+                TEXT,
+            );
+        }
         painter.text(
             pos2(center.x, rect.top() + 112.0),
             Align2::CENTER_CENTER,
@@ -386,8 +589,55 @@ impl Knob {
 
         response
             .on_hover_cursor(CursorIcon::ResizeVertical)
-            .on_hover_text("Drag to turn · Shift for fine · double-click to reset")
+            .on_hover_text("Drag to turn · click to type a value · Shift for fine · double-click to reset")
     }
+}
+
+/// The switches for which controls the LFO moves.
+fn lfo_targets(ui: &mut Ui, params: &Params, settings: &Settings, sampling: bool) {
+    let (rect, _) = ui.allocate_exact_size(vec2(146.0, 122.0), Sense::hover());
+    let names = [
+        (LfoTarget::Wave, "Wave"),
+        (LfoTarget::Pitch, if sampling { "Speed" } else { "Pitch" }),
+        (LfoTarget::Silence, "Silence"),
+        (LfoTarget::Cutoff, "Cutoff"),
+        (LfoTarget::Resonance, "Resonance"),
+        (LfoTarget::FilterType, "Type"),
+    ];
+
+    for (i, (target, name)) in names.into_iter().enumerate() {
+        let corner = rect.left_top() + vec2((i % 2) as f32 * 76.0, 8.0 + (i / 2) as f32 * 30.0);
+        let chip = Rect::from_min_size(corner, vec2(70.0, 24.0));
+        let response = ui
+            .interact(chip, ui.id().with(("lfo target", i)), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand);
+        if response.clicked() {
+            params.toggle_lfo_target(target);
+        }
+
+        // A click flips it, so show the opposite of what was read this frame.
+        let on = settings.lfo_moves(target) != response.clicked();
+        let painter = ui.painter();
+        painter.rect_filled(chip, 12.0, if on || response.hovered() { RAISED } else { PANEL });
+        if on {
+            painter.rect_stroke(chip.shrink(0.5), 12.0, stroke(1.0, ACCENT));
+        }
+        painter.text(
+            chip.center(),
+            Align2::CENTER_CENTER,
+            name,
+            FontId::proportional(11.0),
+            if on { TEXT } else { DIM },
+        );
+    }
+
+    ui.painter().text(
+        pos2(rect.center().x, rect.top() + 112.0),
+        Align2::CENTER_CENTER,
+        "LFO moves",
+        FontId::proportional(12.0),
+        DIM,
+    );
 }
 
 /// A knob wired straight to one of the live synth controls.
@@ -468,6 +718,93 @@ fn tab_button(ui: &mut Ui, name: &str, selected: bool) -> Response {
     response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
+/// The loaded sample drawn end to end. Click it to load a different file.
+fn sample_strip(
+    ui: &mut Ui,
+    loaded: Option<(&str, f32)>,
+    peaks: &[(f32, f32)],
+    active: bool,
+    playhead: Option<f32>,
+    error: Option<&str>,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 64.0), Sense::click());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 8.0, if response.hovered() { RAISED } else { PANEL });
+    if active {
+        painter.rect_stroke(rect.shrink(0.5), 8.0, stroke(1.0, ACCENT));
+    }
+
+    let ink = if active { ACCENT } else { DIM };
+    let mid = rect.center().y + 6.0;
+    let amp = 20.0;
+    for (i, (low, high)) in peaks.iter().enumerate() {
+        let x = rect.left() + 8.0 + (rect.width() - 16.0) * i as f32 / peaks.len().max(1) as f32;
+        let top = mid - high.clamp(-1.0, 1.0) * amp;
+        let bottom = mid - low.clamp(-1.0, 1.0) * amp;
+        painter.line_segment([pos2(x, top - 0.5), pos2(x, bottom + 0.5)], stroke(1.0, ink));
+    }
+
+    // Where in the sample playback is right now
+    if let Some(position) = playhead {
+        let x = rect.left() + 8.0 + (rect.width() - 16.0) * position.clamp(0.0, 1.0);
+        painter.line_segment([pos2(x, mid - amp - 2.0), pos2(x, mid + amp + 2.0)], stroke(2.0, TEXT));
+    }
+
+    let small = FontId::proportional(11.0);
+    match (error, loaded) {
+        (Some(error), _) => {
+            let warning = Color32::from_rgb(240, 130, 120);
+            painter.text(rect.left_top() + vec2(10.0, 7.0), Align2::LEFT_TOP, error, small, warning);
+        }
+        (None, Some((name, seconds))) => {
+            let title = format!("{name}  ·  {seconds:.2} s");
+            painter.text(rect.left_top() + vec2(10.0, 7.0), Align2::LEFT_TOP, title, small.clone(), TEXT);
+            painter.text(rect.right_top() + vec2(-10.0, 7.0), Align2::RIGHT_TOP, "click to replace", small, DIM);
+        }
+        (None, None) => {
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "Click to load a sample, or drop a sound file on the window",
+                FontId::proportional(13.0),
+                DIM,
+            );
+        }
+    }
+
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// A switch between playing the waves and playing the sample.
+fn source_toggle(ui: &mut Ui, sample_on: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(110.0, 122.0), Sense::click());
+    let painter = ui.painter();
+    let center = pos2(rect.center().x, rect.top() + 46.0);
+
+    let pill = Rect::from_center_size(center, vec2(60.0, 30.0));
+    let fill = if sample_on { ACCENT } else if response.hovered() { RAISED } else { TRACK };
+    painter.rect_filled(pill, 15.0, fill);
+    let handle_x = if sample_on { pill.right() - 15.0 } else { pill.left() + 15.0 };
+    painter.circle_filled(pos2(handle_x, center.y), 11.0, if sample_on { BG } else { TEXT });
+
+    painter.text(
+        pos2(center.x, rect.top() + 94.0),
+        Align2::CENTER_CENTER,
+        if sample_on { "Sample" } else { "Waves" },
+        FontId::proportional(15.0),
+        TEXT,
+    );
+    painter.text(
+        pos2(center.x, rect.top() + 112.0),
+        Align2::CENTER_CENTER,
+        "Source",
+        FontId::proportional(12.0),
+        DIM,
+    );
+
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
 /// One round button that plays or stops.
 fn play_button(ui: &mut Ui, playing: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(110.0, 122.0), Sense::click());
@@ -524,10 +861,45 @@ fn noise(seed: u32) -> f32 {
     (x as f32 / u32::MAX as f32) * 2.0 - 1.0
 }
 
-/// Draws the wave straight from the oscillator (dim) and what is left of it
-/// after the silence distortion and the filter (bright). It runs the real
+/// Turns a run of values into a line across `rect`. When there are far more
+/// values than pixels, each pixel column gets its highest and lowest value so
+/// no peaks are skipped.
+fn trace(rect: Rect, values: &[f32], y_of: impl Fn(f32) -> f32) -> Vec<Pos2> {
+    let columns = rect.width().max(1.0) as usize;
+    if values.len() <= columns * 2 {
+        let last = (values.len().max(2) - 1) as f32;
+        return values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| pos2(rect.left() + rect.width() * i as f32 / last, y_of(*v)))
+            .collect();
+    }
+
+    let mut points = Vec::with_capacity(columns * 2);
+    for column in 0..columns {
+        let from = column * values.len() / columns;
+        let to = ((column + 1) * values.len() / columns).max(from + 1);
+        let slice = &values[from..to];
+        let low = slice.iter().copied().fold(f32::MAX, f32::min);
+        let high = slice.iter().copied().fold(f32::MIN, f32::max);
+        let x = rect.left() + column as f32 + 0.5;
+        points.push(pos2(x, y_of(high)));
+        points.push(pos2(x, y_of(low)));
+    }
+    points
+}
+
+/// Draws the sound straight from the oscillator or sample (dim) and what is
+/// left of it after the silence and the filter (bright). It runs the real
 /// synth code for the length of the window, so it matches what is heard.
-fn scope(ui: &mut Ui, settings: &Settings, shape_now: f32, playing: bool, time: f64) {
+fn scope(
+    ui: &mut Ui,
+    settings: &Settings,
+    sample: Option<Arc<SampleData>>,
+    lfo: f32,
+    live_phase: Option<f32>,
+    time: f64,
+) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 170.0), Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 10.0, PANEL);
@@ -538,9 +910,11 @@ fn scope(ui: &mut Ui, settings: &Settings, shape_now: f32, playing: bool, time: 
 
     painter.line_segment([pos2(rect.left(), mid), pos2(rect.right(), mid)], stroke(1.0, TRACK));
 
-    // Anything in the wave above this level gets dropped to silence.
-    if settings.silence < 1.0 {
-        let y = y_of(settings.silence);
+    // With waves, anything above this level gets dropped to silence.
+    // (With a sample, Silence cuts in time instead, so there is no such line.)
+    let silence_now = settings.modulated(lfo).silence;
+    if sample.is_none() && silence_now < 1.0 {
+        let y = y_of(silence_now);
         let mut x = rect.left() + 8.0;
         while x < rect.right() - 8.0 {
             painter.line_segment([pos2(x, y), pos2(x + 5.0, y)], stroke(1.0, DIM));
@@ -555,39 +929,54 @@ fn scope(ui: &mut Ui, settings: &Settings, shape_now: f32, playing: bool, time: 
         );
     }
 
-    // Freeze the LFO at its current position, and leave volume out so a quiet
-    // setting doesn't flatten the picture.
-    let frozen = Settings { shape: shape_now, lfo_depth: 0.0, ..*settings };
-    let rate = SAMPLE_RATE * SCOPE_OVERSAMPLE;
-    let points = (SCOPE_WINDOW * rate as f32) as usize;
+    // Waves get a fixed 10 ms window. A sample gets two of its cycles, up to
+    // one second, since a cycle can be anything from a blip to several seconds.
+    let cycles_per_second = match &sample {
+        Some(sample) => settings.speed / sample.duration(),
+        None => settings.frequency,
+    };
+    let window = match &sample {
+        Some(_) => (2.0 / cycles_per_second).clamp(0.002, 1.0),
+        None => SCOPE_WINDOW,
+    };
+    // Short windows are drawn at a multiple of the audio rate so they look smooth.
+    let rate = if window > 0.02 { SAMPLE_RATE } else { SAMPLE_RATE * SCOPE_OVERSAMPLE };
+
+    let points = (window * rate as f32) as usize;
     // Run for a while before the visible part so the filter has settled.
     let lead_in = (0.040 * rate as f32) as usize;
 
-    // While playing, drift slowly through the wave so it reads as live.
-    let (start_cycles, seed) = if playing {
-        ((settings.frequency as f64 * time * 0.002).fract() as f32, (time * 30.0) as u32)
-    } else {
-        (0.0, 1)
+    let slow_sample = sample.is_some() && cycles_per_second < 8.0;
+    let (start_cycles, seed) = match live_phase {
+        // A slow sample scrolls past in real time, with "now" at the right edge.
+        Some(phase) if slow_sample => (phase - window * cycles_per_second, 1),
+        // Anything faster would be a blur, so drift through it slowly instead.
+        Some(_) => ((cycles_per_second as f64 * time * 0.002).fract() as f32, (time * 30.0) as u32),
+        None => (0.0, 1),
     };
 
+    let source_label = if sample.is_some() { "sample" } else { "wave" };
     let mut voice = Voice::new(rate);
-    voice.snap(&frozen);
+    voice.set_sample(sample);
+    voice.snap(settings);
+    // Hold the LFO where it is right now, so the picture is of this instant.
+    voice.freeze_lfo(lfo);
     voice.seed(seed.wrapping_mul(7919).wrapping_add(12345));
-    voice.set_phase(start_cycles - lead_in as f32 * settings.frequency / rate as f32);
+    voice.set_phase(start_cycles - lead_in as f32 * cycles_per_second / rate as f32);
     for _ in 0..lead_in {
-        voice.tick(&frozen);
+        voice.tick(settings);
     }
 
-    let mut wave = Vec::with_capacity(points);
+    let mut source = Vec::with_capacity(points);
     let mut output = Vec::with_capacity(points);
-    for i in 0..points {
-        let frame = voice.tick(&frozen);
-        let x = rect.left() + rect.width() * i as f32 / (points - 1) as f32;
-        wave.push(pos2(x, y_of(frame.raw)));
-        output.push(pos2(x, y_of(frame.filtered)));
+    for _ in 0..points {
+        let frame = voice.tick(settings);
+        source.push(frame.raw);
+        output.push(frame.filtered);
     }
+    let output = trace(rect, &output, y_of);
 
-    painter.add(Shape::line(wave, stroke(1.5, GHOST)));
+    painter.add(Shape::line(trace(rect, &source, y_of), stroke(1.5, GHOST)));
     painter.add(Shape::line(output.clone(), stroke(6.0, ACCENT.gamma_multiply(0.15))));
     painter.add(Shape::line(output, stroke(2.0, ACCENT)));
 
@@ -598,17 +987,22 @@ fn scope(ui: &mut Ui, settings: &Settings, shape_now: f32, playing: bool, time: 
         FontId::proportional(12.0),
         DIM,
     );
+    let window_label = if window >= 0.9995 {
+        format!("{window:.1} s")
+    } else {
+        format!("{:.0} ms", window * 1000.0)
+    };
     painter.text(
         rect.right_top() + vec2(-12.0, 10.0),
         Align2::RIGHT_TOP,
-        format!("{:.0} ms", SCOPE_WINDOW * 1000.0),
+        window_label,
         FontId::proportional(11.0),
         DIM,
     );
     let legend = painter.text(
         rect.left_bottom() + vec2(12.0, -9.0),
         Align2::LEFT_BOTTOM,
-        "wave",
+        source_label,
         FontId::proportional(10.0),
         DIM,
     );
@@ -623,7 +1017,7 @@ fn scope(ui: &mut Ui, settings: &Settings, shape_now: f32, playing: bool, time: 
 
 /// The filter's curve: which frequencies get through, low on the left to high
 /// on the right. Drag on it to move the cutoff (sideways) and resonance (up/down).
-fn filter_graph(ui: &mut Ui, params: &Params, settings: &Settings) {
+fn filter_graph(ui: &mut Ui, params: &Params, settings: &Settings, lfo: f32) {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 64.0), Sense::click_and_drag());
     let (f_min, f_max) = GRAPH_FREQ;
     let (db_min, db_max) = GRAPH_DB;
@@ -637,9 +1031,15 @@ fn filter_graph(ui: &mut Ui, params: &Params, settings: &Settings) {
             params.resonance.store(1.0 - ty, Ordering::Relaxed);
         }
     }
-    // Re-read so the curve follows the pointer on this very frame.
-    let cutoff = params.cutoff.load(Ordering::Relaxed);
-    let resonance = params.resonance.load(Ordering::Relaxed);
+    // Re-read so the curve follows the pointer on this very frame, then apply
+    // the LFO so the curve shows the filter as it is right now.
+    let shown = Settings {
+        cutoff: params.cutoff.load(Ordering::Relaxed),
+        resonance: params.resonance.load(Ordering::Relaxed),
+        ..*settings
+    }
+    .modulated(lfo);
+    let (cutoff, resonance) = (shown.cutoff, shown.resonance);
 
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 8.0, if response.hovered() { RAISED } else { PANEL });
@@ -657,7 +1057,7 @@ fn filter_graph(ui: &mut Ui, params: &Params, settings: &Settings) {
         .map(|i| {
             let t = i as f32 / steps as f32;
             let freq = f_min * (f_max / f_min).powf(t);
-            let gain = filter_response(freq, cutoff, resonance, settings.filter_morph);
+            let gain = filter_response(freq, cutoff, resonance, shown.filter_morph);
             pos2(rect.left() + t * rect.width(), y_of(20.0 * gain.max(1e-6).log10()))
         })
         .collect();
@@ -680,5 +1080,13 @@ fn main() -> eframe::Result {
             .with_min_inner_size([480.0, 600.0]),
         ..Default::default()
     };
-    run_native("Pulsar", win_option, Box::new(|_cc| Ok(Box::new(app))))
+    run_native(
+        "Pulsar",
+        win_option,
+        Box::new(|cc| {
+            // Dark everywhere, including tooltips and the type-a-value boxes.
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            Ok(Box::new(app))
+        }),
+    )
 }

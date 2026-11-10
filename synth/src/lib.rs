@@ -1,8 +1,9 @@
 use atomic_float::AtomicF32;
 use rodio::Source;
 use std::f32::consts::{PI, TAU};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -159,6 +160,38 @@ pub fn lfo_value(shape: &LfoShape, phase: f32) -> f32 {
    }
 }
 
+/// The controls the LFO can move. Any number of them can be switched on at once.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LfoTarget {
+   /// Wave position, up to 4 waves either way
+   Wave,
+   /// Frequency, or Speed when a sample is playing: up to 2 octaves either way
+   Pitch,
+   /// Up to 0.5 either way
+   Silence,
+   /// Filter cutoff, up to 4 octaves either way
+   Cutoff,
+   /// Up to 50% either way
+   Resonance,
+   /// Filter type, up to half the lowpass-to-highpass range either way
+   FilterType,
+}
+
+impl LfoTarget {
+   pub const ALL: [LfoTarget; 6] = [
+      LfoTarget::Wave,
+      LfoTarget::Pitch,
+      LfoTarget::Silence,
+      LfoTarget::Cutoff,
+      LfoTarget::Resonance,
+      LfoTarget::FilterType,
+   ];
+
+   fn bit(&self) -> u8 {
+      1 << (*self as u8)
+   }
+}
+
 // ---------------------------------------------------------------------------
 // Filter
 // ---------------------------------------------------------------------------
@@ -193,6 +226,50 @@ pub fn filter_response(freq: f32, cutoff: f32, resonance: f32, morph: f32) -> f3
 }
 
 // ---------------------------------------------------------------------------
+// Samples
+// ---------------------------------------------------------------------------
+
+/// A loaded sound, mixed down to one channel.
+pub struct SampleData {
+   pub samples: Vec<f32>,
+   pub sample_rate: u32,
+}
+
+impl SampleData {
+   /// Reads a wav, mp3, flac or ogg file.
+   pub fn from_file(path: &Path) -> Result<SampleData, String> {
+      let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+      let decoder = rodio::Decoder::new(std::io::BufReader::new(file)).map_err(|e| e.to_string())?;
+      let channels = decoder.channels().max(1) as usize;
+      let sample_rate = decoder.sample_rate();
+      let interleaved: Vec<f32> = decoder.convert_samples().collect();
+      let samples: Vec<f32> = interleaved
+         .chunks(channels)
+         .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+         .collect();
+      if samples.len() < 2 {
+         return Err("the file has no audio in it".to_string());
+      }
+      Ok(SampleData { samples, sample_rate })
+   }
+
+   /// Length in seconds at normal speed
+   pub fn duration(&self) -> f32 {
+      self.samples.len() as f32 / self.sample_rate as f32
+   }
+
+   /// The sample at `position` (0.0 = start, 1.0 = end), smoothed between points.
+   pub fn at(&self, position: f32) -> f32 {
+      let last = self.samples.len() - 1;
+      let exact = position.clamp(0.0, 1.0) * last as f32;
+      let index = (exact as usize).min(last);
+      let next = (index + 1).min(last);
+      let blend = exact - index as f32;
+      self.samples[index] * (1.0 - blend) + self.samples[next] * blend
+   }
+}
+
+// ---------------------------------------------------------------------------
 // Settings shared between the UI and the audio thread
 // ---------------------------------------------------------------------------
 
@@ -213,8 +290,15 @@ pub struct Settings {
    pub lfo_shape: LfoShape,
    /// Hz
    pub lfo_rate: f32,
-   /// How far the LFO pushes the Wave position either way, in waves
+   /// How hard the LFO pushes its targets, 0.0..=1.0
    pub lfo_depth: f32,
+   /// Which controls the LFO moves, one bit per `LfoTarget`
+   pub lfo_targets: u8,
+   /// Play the loaded sample instead of the waves
+   pub use_sample: bool,
+   /// Sample mode's stand-in for frequency: how many times per sample-length
+   /// the cycle repeats. 1.0 with Silence at 1.0 plays the sample as recorded.
+   pub speed: f32,
 }
 
 impl Default for Settings {
@@ -229,7 +313,33 @@ impl Default for Settings {
          filter_morph: 0.0,
          lfo_shape: LfoShape::Sine,
          lfo_rate: 1.0,
-         lfo_depth: 0.0,
+         lfo_depth: 0.5,
+         lfo_targets: 0,
+         use_sample: false,
+         speed: 1.0,
+      }
+   }
+}
+
+impl Settings {
+   pub fn lfo_moves(&self, target: LfoTarget) -> bool {
+      self.lfo_targets & target.bit() != 0
+   }
+
+   /// These settings with the LFO applied, for an LFO value of -1.0..=1.0.
+   pub fn modulated(&self, lfo: f32) -> Settings {
+      let push = lfo * self.lfo_depth;
+      let amount = |target: LfoTarget| if self.lfo_moves(target) { push } else { 0.0 };
+      let pitch = 2.0_f32.powf(2.0 * amount(LfoTarget::Pitch));
+      Settings {
+         shape: (self.shape + 4.0 * amount(LfoTarget::Wave)).clamp(0.0, MAX_SHAPE),
+         frequency: self.frequency * pitch,
+         speed: self.speed * pitch,
+         silence: (self.silence + 0.5 * amount(LfoTarget::Silence)).clamp(0.001, 1.0),
+         cutoff: (self.cutoff * 2.0_f32.powf(4.0 * amount(LfoTarget::Cutoff))).clamp(20.0, 20000.0),
+         resonance: (self.resonance + 0.5 * amount(LfoTarget::Resonance)).clamp(0.0, 1.0),
+         filter_morph: (self.filter_morph + 0.5 * amount(LfoTarget::FilterType)).clamp(0.0, 1.0),
+         ..*self
       }
    }
 }
@@ -246,9 +356,19 @@ pub struct Params {
    lfo_shape: AtomicU8,
    pub lfo_rate: AtomicF32,
    pub lfo_depth: AtomicF32,
+   lfo_targets: AtomicU8,
+   pub use_sample: AtomicBool,
+   pub speed: AtomicF32,
+   sample: Mutex<Option<Arc<SampleData>>>,
+   /// Goes up every time the sample is replaced, so the audio thread knows to fetch it.
+   sample_version: AtomicU32,
    /// Written by the audio thread: where the Wave position is right now,
    /// LFO included.
    pub shape_now: AtomicF32,
+   /// Written by the audio thread: the LFO's current value, -1.0..=1.0
+   pub lfo_now: AtomicF32,
+   /// Written by the audio thread: how far through the current cycle it is, 0.0..1.0
+   pub phase_now: AtomicF32,
 }
 
 impl Default for Params {
@@ -265,7 +385,14 @@ impl Default for Params {
          lfo_shape: AtomicU8::new(s.lfo_shape as u8),
          lfo_rate: AtomicF32::new(s.lfo_rate),
          lfo_depth: AtomicF32::new(s.lfo_depth),
+         lfo_targets: AtomicU8::new(s.lfo_targets),
+         use_sample: AtomicBool::new(s.use_sample),
+         speed: AtomicF32::new(s.speed),
+         sample: Mutex::new(None),
+         sample_version: AtomicU32::new(0),
          shape_now: AtomicF32::new(s.shape),
+         lfo_now: AtomicF32::new(0.0),
+         phase_now: AtomicF32::new(0.0),
       }
    }
 }
@@ -277,6 +404,16 @@ impl Params {
 
    pub fn set_lfo_shape(&self, shape: LfoShape) {
       self.lfo_shape.store(shape as u8, Ordering::Relaxed);
+   }
+
+   /// Switches the LFO on or off for one control.
+   pub fn toggle_lfo_target(&self, target: LfoTarget) {
+      self.lfo_targets.fetch_xor(target.bit(), Ordering::Relaxed);
+   }
+
+   pub fn set_sample(&self, sample: Option<Arc<SampleData>>) {
+      *self.sample.lock().unwrap() = sample;
+      self.sample_version.fetch_add(1, Ordering::Relaxed);
    }
 
    pub fn load(&self) -> Settings {
@@ -292,6 +429,9 @@ impl Params {
          lfo_shape: self.lfo_shape(),
          lfo_rate: self.lfo_rate.load(o),
          lfo_depth: self.lfo_depth.load(o),
+         lfo_targets: self.lfo_targets.load(o),
+         use_sample: self.use_sample.load(o),
+         speed: self.speed.load(o),
       }
    }
 }
@@ -311,6 +451,10 @@ pub struct Frame {
    pub out: f32,
    /// The Wave position used for this sample, LFO included
    pub shape: f32,
+   /// The LFO's value for this sample, -1.0..=1.0
+   pub lfo: f32,
+   /// How far through the cycle this sample is, 0.0..1.0
+   pub phase: f32,
 }
 
 /// All the sound-making state. The UI also runs one of these to draw the scope,
@@ -318,9 +462,12 @@ pub struct Frame {
 #[derive(Clone)]
 pub struct Voice {
    sample_rate: f32,
+   sample: Option<Arc<SampleData>>,
    phase: f32,
    lfo_phase: f32,
    lfo_hold: f32,
+   /// When set, the LFO stays at this value instead of running
+   lfo_frozen: Option<f32>,
    rng: u32,
    /// The controls as currently applied; they glide toward the targets to avoid clicks.
    now: Settings,
@@ -340,9 +487,11 @@ impl Voice {
       let sample_rate = sample_rate as f32;
       let mut voice = Voice {
          sample_rate,
+         sample: None,
          phase: 0.0,
          lfo_phase: 0.0,
          lfo_hold: 0.0,
+         lfo_frozen: None,
          rng: 0x2545_F491,
          now: Settings::default(),
          // Starts silent and glides up, so starting playback fades in.
@@ -356,7 +505,7 @@ impl Voice {
          coef_cutoff: -1.0,
          coef_resonance: -1.0,
       };
-      voice.update_filter();
+      voice.update_filter(voice.now.cutoff, voice.now.resonance);
       voice
    }
 
@@ -364,6 +513,15 @@ impl Voice {
    pub fn snap(&mut self, settings: &Settings) {
       self.now = *settings;
       self.gain = settings.volume * settings.volume;
+   }
+
+   pub fn set_sample(&mut self, sample: Option<Arc<SampleData>>) {
+      self.sample = sample;
+   }
+
+   /// Stop the LFO and hold it at `value` (-1.0..=1.0). Used to draw a still picture.
+   pub fn freeze_lfo(&mut self, value: f32) {
+      self.lfo_frozen = Some(value);
    }
 
    pub fn set_phase(&mut self, phase: f32) {
@@ -382,12 +540,12 @@ impl Voice {
       (self.rng as f32 / u32::MAX as f32) * 2.0 - 1.0
    }
 
-   fn update_filter(&mut self) {
-      let cutoff = self.now.cutoff.clamp(10.0, self.sample_rate * 0.45);
-      self.g = (PI * cutoff / self.sample_rate).tan();
-      self.k = 1.0 / resonance_to_q(self.now.resonance);
-      self.coef_cutoff = self.now.cutoff;
-      self.coef_resonance = self.now.resonance;
+   fn update_filter(&mut self, cutoff: f32, resonance: f32) {
+      let safe_cutoff = cutoff.clamp(10.0, self.sample_rate * 0.45);
+      self.g = (PI * safe_cutoff / self.sample_rate).tan();
+      self.k = 1.0 / resonance_to_q(resonance);
+      self.coef_cutoff = cutoff;
+      self.coef_resonance = resonance;
    }
 
    pub fn tick(&mut self, target: &Settings) -> Frame {
@@ -401,6 +559,9 @@ impl Voice {
       now.resonance += a * (target.resonance - now.resonance);
       now.filter_morph += a * (target.filter_morph - now.filter_morph);
       now.lfo_depth += a * (target.lfo_depth - now.lfo_depth);
+      now.speed += a * (target.speed - now.speed);
+      now.use_sample = target.use_sample;
+      now.lfo_targets = target.lfo_targets;
       now.lfo_rate = target.lfo_rate;
       now.lfo_shape = target.lfo_shape;
       now.volume = target.volume;
@@ -412,27 +573,47 @@ impl Voice {
          self.lfo_phase -= self.lfo_phase.floor();
          self.lfo_hold = self.random();
       }
-      let lfo = match self.now.lfo_shape {
-         LfoShape::Random => self.lfo_hold,
-         shape => lfo_value(&shape, self.lfo_phase),
+      let lfo = match (self.lfo_frozen, self.now.lfo_shape) {
+         (Some(value), _) => value,
+         (None, LfoShape::Random) => self.lfo_hold,
+         (None, shape) => lfo_value(&shape, self.lfo_phase),
       };
-      let shape = (self.now.shape + lfo * self.now.lfo_depth).clamp(0.0, MAX_SHAPE);
+      // Everything below uses the settings with the LFO's push applied.
+      let set = self.now.modulated(lfo);
+      let shape = set.shape;
 
-      // Oscillator
-      self.phase += self.now.frequency / self.sample_rate;
-      self.phase -= self.phase.floor();
-      let noise = if shape > MAX_SHAPE - 1.0 { self.random() } else { 0.0 };
-      let raw = morph_value(shape, self.phase, noise);
+      let (raw, distorted) = match &self.sample {
+         Some(sample) if set.use_sample => {
+            // Sample mode, as in pulsar synthesis: every cycle reads the whole
+            // sample during the first `silence` part of the cycle and is quiet
+            // for the rest. So the cycle rate sets how fast the sample is read
+            // rather than a pitch in Hz.
+            let cycles_per_second = set.speed / sample.duration();
+            self.phase += cycles_per_second / self.sample_rate;
+            self.phase -= self.phase.floor();
+            let position = self.phase / set.silence;
+            let pulse = if position <= 1.0 { sample.at(position) } else { 0.0 };
+            (sample.at(self.phase), pulse.clamp(-1.0, 1.0))
+         }
+         _ => {
+            // Oscillator
+            self.phase += set.frequency / self.sample_rate;
+            self.phase -= self.phase.floor();
+            let noise = if shape > MAX_SHAPE - 1.0 { self.random() } else { 0.0 };
+            let raw = morph_value(shape, self.phase, noise);
 
-      // Silence distortion. The clamp is what the sound card would do anyway,
-      // and keeps infinities out of the filter.
-      let distorted = apply_silence(raw, self.now.silence.max(0.001)).clamp(-1.0, 1.0);
+            // Silence distortion. The clamp is what the sound card would do
+            // anyway, and keeps infinities out of the filter.
+            let distorted = apply_silence(raw, set.silence).clamp(-1.0, 1.0);
+            (raw, distorted)
+         }
+      };
 
       // Filter (a state-variable filter gives low, band and high outputs at once)
-      if (self.now.cutoff - self.coef_cutoff).abs() > self.coef_cutoff.abs() * 1e-4
-         || (self.now.resonance - self.coef_resonance).abs() > 1e-4
+      if (set.cutoff - self.coef_cutoff).abs() > self.coef_cutoff.abs() * 1e-4
+         || (set.resonance - self.coef_resonance).abs() > 1e-4
       {
-         self.update_filter();
+         self.update_filter(set.cutoff, set.resonance);
       }
       let (g, k) = (self.g, self.k);
       let a1 = 1.0 / (1.0 + g * (g + k));
@@ -444,7 +625,7 @@ impl Voice {
       self.ic1 = 2.0 * v1 - self.ic1;
       self.ic2 = 2.0 * v2 - self.ic2;
       let (low, band, high) = (v2, k * v1, distorted - k * v1 - v2);
-      let (mix_low, mix_band, mix_high) = filter_mix(self.now.filter_morph);
+      let (mix_low, mix_band, mix_high) = filter_mix(set.filter_morph);
       let mut filtered = low * mix_low + band * mix_band + high * mix_high;
       if !filtered.is_finite() {
          self.ic1 = 0.0;
@@ -457,6 +638,8 @@ impl Voice {
          filtered,
          out: (filtered * self.gain).clamp(-1.0, 1.0),
          shape,
+         lfo,
+         phase: self.phase,
       }
    }
 }
@@ -472,6 +655,7 @@ pub struct Oscillator {
    voice: Voice,
    sample_rate: u32,
    until_refresh: u32,
+   sample_version: u32,
 }
 
 impl Oscillator {
@@ -480,7 +664,9 @@ impl Oscillator {
       let mut voice = Voice::new(sample_rate);
       // Start from the current knob positions, but leave the volume at zero to fade in.
       voice.snap(&Settings { volume: 0.0, ..settings });
-      Oscillator { params, settings, voice, sample_rate, until_refresh: 0 }
+      // One less than the current version, so the first refresh picks the sample up.
+      let sample_version = params.sample_version.load(Ordering::Relaxed).wrapping_sub(1);
+      Oscillator { params, settings, voice, sample_rate, until_refresh: 0, sample_version }
    }
 }
 
@@ -492,12 +678,22 @@ impl Iterator for Oscillator {
       if refresh {
          self.settings = self.params.load();
          self.until_refresh = 16;
+         let version = self.params.sample_version.load(Ordering::Relaxed);
+         if version != self.sample_version {
+            // Never wait for the UI here; if it is mid-update, catch it next time.
+            if let Ok(sample) = self.params.sample.try_lock() {
+               self.voice.set_sample(sample.clone());
+               self.sample_version = version;
+            }
+         }
       }
       self.until_refresh -= 1;
 
       let frame = self.voice.tick(&self.settings);
       if refresh {
          self.params.shape_now.store(frame.shape, Ordering::Relaxed);
+         self.params.lfo_now.store(frame.lfo, Ordering::Relaxed);
+         self.params.phase_now.store(frame.phase, Ordering::Relaxed);
       }
       Some(frame.out)
    }
@@ -556,7 +752,8 @@ mod tests {
                filter_morph: morph,
                cutoff: 500.0,
                volume: 1.0,
-               lfo_depth: 4.0,
+               lfo_depth: 1.0,
+               lfo_targets: 0b11_1111,
                lfo_rate: 20.0,
                lfo_shape: LfoShape::Random,
                ..Settings::default()
@@ -595,8 +792,55 @@ mod tests {
    }
 
    #[test]
+   fn sample_mode_plays_the_whole_sample_then_silence_each_cycle() {
+      // A one-second sample that ramps from 0 up to 1.
+      let ramp: Vec<f32> = (0..1000).map(|i| i as f32 / 999.0).collect();
+      let sample = Arc::new(SampleData { samples: ramp, sample_rate: 1000 });
+      let settings = Settings { use_sample: true, speed: 2.0, silence: 0.5, ..Settings::default() };
+
+      let mut voice = Voice::new(44100);
+      voice.set_sample(Some(sample));
+      voice.snap(&settings);
+      // Speed 2 on a one-second sample: one cycle lasts half a second.
+      let cycle: Vec<f32> = (0..22050).map(|_| voice.tick(&settings).filtered).collect();
+
+      // The whole ramp fits in the first half of the cycle...
+      assert!((cycle[5512] - 0.5).abs() < 0.02, "quarter of the way in: {}", cycle[5512]);
+      assert!(cycle[10900] > 0.95, "end of the pulse: {}", cycle[10900]);
+      // ...and the second half is silent.
+      assert!(cycle[12000..22000].iter().all(|v| v.abs() < 0.01));
+   }
+
+   #[test]
+   fn lfo_only_moves_the_controls_it_is_pointed_at() {
+      let base = Settings {
+         lfo_depth: 1.0,
+         lfo_targets: LfoTarget::Cutoff.bit() | LfoTarget::Pitch.bit(),
+         cutoff: 1000.0,
+         ..Settings::default()
+      };
+      let up = base.modulated(1.0);
+      let down = base.modulated(-1.0);
+      assert!((up.cutoff - 16000.0).abs() < 1.0 && (down.cutoff - 62.5).abs() < 0.1);
+      assert!((up.frequency - 1760.0).abs() < 0.1 && (down.speed - 0.25).abs() < 0.001);
+      // Not targeted, so untouched
+      assert_eq!(up.shape, base.shape);
+      assert_eq!(up.silence, base.silence);
+      assert_eq!(up.resonance, base.resonance);
+      // With no targets the LFO does nothing at all
+      let off = Settings { lfo_targets: 0, ..base }.modulated(1.0);
+      assert_eq!((off.cutoff, off.frequency), (base.cutoff, base.frequency));
+   }
+
+   #[test]
    fn lfo_moves_the_wave_position() {
-      let settings = Settings { shape: 4.0, lfo_depth: 2.0, lfo_rate: 10.0, ..Settings::default() };
+      let settings = Settings {
+         shape: 4.0,
+         lfo_depth: 0.5,
+         lfo_targets: LfoTarget::Wave.bit(),
+         lfo_rate: 10.0,
+         ..Settings::default()
+      };
       let frames = run(settings, 44100);
       let lowest = frames.iter().map(|f| f.shape).fold(f32::MAX, f32::min);
       let highest = frames.iter().map(|f| f.shape).fold(f32::MIN, f32::max);
